@@ -1,0 +1,89 @@
+name: bdd-lab
+
+# Everything needed to run the suite with Docker only: no local JDK, Maven, browsers or drivers.
+#   docker compose up -d --wait                 # app + Selenium Grid (Chrome and Firefox nodes)
+#   docker compose run --rm tests               # run the suite inside a Maven container
+#   BROWSER=firefox docker compose run --rm tests
+
+x-shipdesk-ref: &shipdesk_ref 249b36a34f4dcbbd17576e5b733d3a89b9df8420
+
+services:
+  # The application under test: ShipDesk, pinned to a commit of the public playwright-e2e-framework repo.
+  shipdesk:
+    image: node:22-alpine
+    environment:
+      SHIPDESK_REPO: https://github.com/murillovskfilho/playwright-e2e-framework.git
+      SHIPDESK_REF: *shipdesk_ref
+      PORT: "3000"
+    command: >
+      sh -c "apk add --no-cache git >/dev/null &&
+             (test -d /app/.git || git clone --quiet $$SHIPDESK_REPO /app) &&
+             cd /app && git fetch --quiet origin && git checkout --quiet $$SHIPDESK_REF &&
+             npm ci --no-audit --no-fund --loglevel=error && npm run app"
+    volumes:
+      - shipdesk:/app
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/login"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+
+  selenium-hub:
+    image: selenium/hub:4.51.0
+    ports:
+      - "4444:4444"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4444/wd/hub/status | grep -q '\"ready\": true'"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  chrome:
+    image: selenium/node-chrome:4.51.0
+    shm_size: 2gb
+    depends_on: [selenium-hub]
+    environment: &node_env
+      SE_EVENT_BUS_HOST: selenium-hub
+      SE_EVENT_BUS_PUBLISH_PORT: "4442"
+      SE_EVENT_BUS_SUBSCRIBE_PORT: "4443"
+      SE_NODE_MAX_SESSIONS: "4"
+      SE_NODE_OVERRIDE_MAX_SESSIONS: "true"
+      SE_VNC_NO_PASSWORD: "true"
+    ports:
+      - "7900:7900" # watch the browser live at http://localhost:7900
+
+  firefox:
+    image: selenium/node-firefox:4.51.0
+    shm_size: 2gb
+    depends_on: [selenium-hub]
+    environment: *node_env
+    ports:
+      - "7901:7900"
+
+  tests:
+    image: maven:3.9-eclipse-temurin-21
+    profiles: ["tests"]
+    working_dir: /work
+    depends_on:
+      shipdesk:
+        condition: service_healthy
+      selenium-hub:
+        condition: service_healthy
+    environment:
+      BROWSER: ${BROWSER:-chrome}
+      GRID_URL: http://selenium-hub:4444
+      APP_URL: http://shipdesk:3000 # as seen by the browsers on the grid
+      API_URL: http://shipdesk:3000 # as seen by the test JVM
+      TAGS: ${TAGS:-}
+    command: >
+      sh -c "mvn -B -ntp test -Dcucumber.filter.tags=\"$${TAGS:-not @wip}\""
+    volumes:
+      - .:/work
+      - m2:/root/.m2
+
+volumes:
+  shipdesk:
+  m2:
