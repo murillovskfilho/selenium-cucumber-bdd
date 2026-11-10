@@ -103,6 +103,50 @@ src/test/resources/features/   Gherkin specifications
 docker-compose.yml             ShipDesk + Selenium Grid + a Maven container
 ```
 
+## Design decisions and trade-offs
+
+* **Everything runs in Docker, against a pinned app.** One `docker compose` file starts ShipDesk
+  (cloned at a fixed commit), a Selenium hub and Chrome and Firefox nodes, so a run needs no local
+  JDK, browsers or drivers and fails only when this code or that commit changes. The cost: the first
+  start is slow (image pulls, a clone and `npm ci`), each node reserves 2 GB of shared memory, and
+  fixes in the app repo reach this suite only when the ref is bumped. It also means two base URLs:
+  the browsers on the grid reach the app as `shipdesk:3000`, the test JVM as `localhost:3000`.
+* **Parallel scenarios, isolated by construction.** TestNG's parallel data provider runs 4
+  scenarios at a time, matching the 4 sessions each grid node allows. PicoContainer gives every
+  scenario a fresh `ScenarioContext` (its own browser, shipment and last response), and every
+  shipment gets a unique reference, so there is no cleanup and no ordering between scenarios. The
+  trade-off: nothing is deleted, so ShipDesk's in-memory store grows until the app restarts, and API
+  tokens are deliberately shared (cached once per persona for the whole run).
+* **Givens go through the API, not the UI.** "Given a shipment created by ..." is a REST Assured
+  call, and signing in plants the session cookie from an API token, so the UI is driven only for
+  the behavior a scenario is about. The UI login form is tested in `authentication.feature` only.
+  The cost: the suite knows how the app's session works (the cookie's name and path), and a change
+  there breaks every signed-in scenario at once.
+* **Declarative Gherkin, with the mapping in code.** Steps state business rules (`the cancel action
+  is not available`), and custom parameter types turn `{persona}` and `{availability}` into an enum
+  and a boolean. Feature files stay readable for non-developers, but the glue is larger: form labels
+  in the feature files are mapped to API field names in `ShipmentData.fieldForLabel`, and that map
+  has to follow the form.
+* **Fields are found by their visible label.** `BasePage.fieldByLabel` finds the `<label>` and
+  follows its `for` attribute, the way a user finds a field, and waits are explicit only (no
+  implicit waits, no sleeps). It costs an extra lookup per field and an XPath under the hood, and
+  renaming a label breaks the step, which is intended: the label is part of what the user sees.
+* **No retries.** Surefire reruns nothing, so a scenario that fails once fails the build. A flaky
+  test is visible, not averaged away, but a single grid hiccup also turns the nightly run red. The
+  Chrome and Firefox runs are merged into one Allure report with the browser as a parameter, which
+  makes "fails only on Firefox" easy to see. The report is published to GitHub Pages from `main`
+  only; pull requests get it as a build artifact.
+
+## What I'd add next
+
+* Pin the GitHub Actions to commit SHAs instead of tags, as qa-starter-kit does.
+* Run the `@api` scenarios in a separate job without the grid. The browser is already created
+  lazily, so those scenarios never start one.
+* A rerun report: run failed scenarios once more and list them as flaky in a separate section, so
+  a retry never turns a failure green silently.
+* `@smoke` only on pull requests and the full Chrome × Firefox matrix nightly, to keep PR feedback
+  fast as the suite grows.
+
 ## Notes from building it
 
 * **Why the app's host is `shipdesk`, not `app`.** The first Grid run failed every scenario with
